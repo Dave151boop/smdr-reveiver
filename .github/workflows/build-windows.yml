@@ -1,0 +1,36 @@
+name: Build Windows artifact
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r dev-requirements.txt
+      - name: Run PyInstaller (single-file)
+        run: |
+          # Try to include PySide6 Qt plugins when available
+          PLUGINS=$(python -c "import os, PySide6; p=os.path.join(os.path.dirname(PySide6.__file__), 'Qt', 'plugins'); print(p if os.path.isdir(p) else '')") || true
+          PLUGINS_ARG=""
+          if [ -n "$PLUGINS" ]; then
+            PLUGINS_ARG="--add-data \"$PLUGINS:PySide6/Qt/plugins\""
+          fi
+          pyinstaller --clean --noconfirm --onefile --windowed --name SMDR --add-data "smdr:smdr" $PLUGINS_ARG main.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMDR-windows
+          path: dist/SMDR.exe

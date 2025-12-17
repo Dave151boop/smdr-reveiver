@@ -1,0 +1,33 @@
+*.pyc
+__pycache__/
+venv/
+.venv/
+smdr.log
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Logs and data
+*.log
+*.dat
+*.ser
+*.cfg
