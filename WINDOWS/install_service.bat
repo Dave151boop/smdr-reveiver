@@ -31,7 +31,7 @@ set "DEFAULT_PORT=7004"
 set "DEFAULT_LOG=%ProgramData%\SMDR Receiver\smdr.log"
 
 REM Locate the built service executable
-set "SOURCE_EXE=%SCRIPT_DIR%dist\%SERVICE_EXE%"
+set "SOURCE_EXE=%SCRIPT_DIR%\%SERVICE_EXE%"
 if not exist "%SOURCE_EXE%" (
   echo.
   echo ERROR: %SOURCE_EXE% not found.
