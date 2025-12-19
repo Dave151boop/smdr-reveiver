@@ -51,10 +51,18 @@ class SMDRViewer(QMainWindow):
         self.config = SMDRConfig()
         self._shading_color = '#eaf8ea'
         
+        # Connection/file mode tracking
+        self.connection_mode = "file"  # "file" or "network"
+
         # File tracking
         self.log_path = self.config.get_log_file()
         self.last_position = 0
         self.lines_displayed = 0
+
+        # Network client state
+        self._net_sock = None
+        self._net_thread = None
+        self._net_running = threading.Event()
         
         # Create UI
         self._create_ui()
@@ -75,6 +83,9 @@ class SMDRViewer(QMainWindow):
         
     def _create_ui(self):
         """Create the user interface."""
+        # Connection status header
+        self.header_label = QLabel("Disconnected from SMDR Server")
+        self.header_label.setStyleSheet("font-weight: bold; color: red;")
         # Table widget
         self.table = QTableWidget()
         self.table.setColumnCount(len(FIELD_NAMES))
@@ -124,6 +135,7 @@ class SMDRViewer(QMainWindow):
         # Layout
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.addWidget(self.header_label)
         layout.addWidget(search_widget)
         layout.addWidget(self.table)
         layout.addWidget(self.status)
@@ -173,6 +185,16 @@ class SMDRViewer(QMainWindow):
         
         service_menu.addSeparator()
         
+        connect_action = QAction("Connect to Service", self)
+        connect_action.triggered.connect(self._start_network_client)
+        service_menu.addAction(connect_action)
+
+        disconnect_action = QAction("Disconnect", self)
+        disconnect_action.triggered.connect(self._stop_network_client)
+        service_menu.addAction(disconnect_action)
+
+        service_menu.addSeparator()
+
         restart_action = QAction("Restart Service", self)
         restart_action.triggered.connect(self._restart_service)
         service_menu.addAction(restart_action)
@@ -215,6 +237,8 @@ class SMDRViewer(QMainWindow):
         
     def _check_for_updates(self):
         """Check for new data in the log file."""
+        if self.connection_mode == "network":
+            return  # network mode reads from socket
         if not self.log_path.exists():
             return
             
@@ -267,7 +291,19 @@ class SMDRViewer(QMainWindow):
             
     def _update_status(self):
         """Update the status bar."""
-        self.status.setText(f"Log file: {self.log_path} — Lines displayed: {self.lines_displayed}")
+        state = (
+            "Connected to SMDR Server"
+            if self.connection_mode == "network"
+            else f"LOG FILE: {self.log_path.name}"
+        )
+        self.status.setText(f"{state} — Lines displayed: {self.lines_displayed}")
+        # Keep header in sync
+        if self.connection_mode == "network":
+            self.header_label.setText("Connected to SMDR Server")
+            self.header_label.setStyleSheet("font-weight: bold; color: blue;")
+        else:
+            self.header_label.setText(f"LOG FILE: {self.log_path.name}")
+            self.header_label.setStyleSheet("font-weight: bold; color: green;")
         
     def _open_log_file(self):
         """Open a different log file."""
@@ -504,11 +540,21 @@ class SMDRViewer(QMainWindow):
         
         layout = QFormLayout(dialog)
         
-        # Port
+        # Port (SMDR receiver port)
         port_input = QSpinBox()
         port_input.setRange(1, 65535)
         port_input.setValue(self.config.get_port())
-        layout.addRow("Port:", port_input)
+        layout.addRow("Receiver Port:", port_input)
+
+        # Viewer broadcast port
+        viewer_port_input = QSpinBox()
+        viewer_port_input.setRange(1, 65535)
+        viewer_port_input.setValue(self.config.get_viewer_port())
+        layout.addRow("Viewer Port:", viewer_port_input)
+
+        # Service host for viewer
+        host_input = QLineEdit(self.config.get_service_host())
+        layout.addRow("Service Host:", host_input)
         
         # Log file
         log_widget = QWidget()
@@ -553,22 +599,34 @@ class SMDRViewer(QMainWindow):
 
         if dialog.exec() == QDialog.Accepted:
             new_port = port_input.value()
+            new_viewer_port = viewer_port_input.value()
+            new_host = host_input.text().strip() or "localhost"
             new_log = Path(log_input.text())
+
             old_port = self.config.get_port()
+            old_viewer_port = self.config.get_viewer_port()
+            old_host = self.config.get_service_host()
             old_log = self.config.get_log_file()
 
-            changed = (new_port != old_port) or (new_log != old_log)
+            changed = (
+                (new_port != old_port) or
+                (new_viewer_port != old_viewer_port) or
+                (new_host != old_host) or
+                (new_log != old_log)
+            )
 
             if changed or dialog._restart_requested:
                 # Save configuration
                 self.config.set_port(new_port)
+                self.config.set_viewer_port(new_viewer_port)
+                self.config.set_service_host(new_host)
                 self.config.set_log_file(new_log)
 
                 # Restart if requested or if settings changed
                 if dialog._restart_requested or changed:
                     if self._restart_service():
                         # Update viewer to use new log file
-                        self.log_path = new_log
+                        self.log_path = self.config.get_log_file()
                         self.last_position = 0
                         self.lines_displayed = 0
                         self.table.setRowCount(0)
@@ -582,6 +640,87 @@ class SMDRViewer(QMainWindow):
                         QMessageBox.information(self, "Success", "Service restarted with new configuration.")
                 else:
                     QMessageBox.information(self, "Saved", "Configuration saved. Restart the service to apply changes.")
+
+    def _start_network_client(self):
+        """Connect to the service's viewer broadcast and stream live data."""
+        if self.connection_mode == "network":
+            return
+        host = self.config.get_service_host()
+        port = self.config.get_viewer_port()
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except Exception as e:
+            QMessageBox.warning(self, "Connection Failed", f"Could not connect to {host}:{port}\n{e}")
+            return
+
+        # Switch to network mode: stop file polling
+        self.connection_mode = "network"
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            self.file_watcher.removePaths(self.file_watcher.files())
+        except Exception:
+            pass
+
+        self._net_sock = sock
+        self._net_running.set()
+        self._net_thread = threading.Thread(target=self._network_loop, daemon=True)
+        self._net_thread.start()
+        self._update_status()
+
+    def _stop_network_client(self):
+        """Disconnect from the service and return to file mode."""
+        if self.connection_mode != "network":
+            return
+        self._net_running.clear()
+        try:
+            if self._net_sock:
+                try:
+                    self._net_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self._net_sock.close()
+        except Exception:
+            pass
+        self._net_sock = None
+        try:
+            if self._net_thread and self._net_thread.is_alive():
+                self._net_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._net_thread = None
+
+        # Return to file mode
+        self.connection_mode = "file"
+        if self.log_path.exists():
+            try:
+                self.file_watcher.addPath(str(self.log_path))
+            except Exception:
+                pass
+        try:
+            self.timer.start(1000)
+        except Exception:
+            pass
+        self._update_status()
+
+    def _network_loop(self):
+        """Read lines from the network socket and process them."""
+        try:
+            f = self._net_sock.makefile("r", encoding="utf-8", errors="replace")
+            while self._net_running.is_set():
+                line = f.readline()
+                if not line:
+                    break
+                self._process_line(line.strip())
+                self.lines_displayed += 1
+                self._update_status()
+        except Exception:
+            pass
+        finally:
+            # Auto-switch to file mode on disconnect on the GUI thread
+            QTimer.singleShot(0, self._stop_network_client)
     
     def _browse_log_file(self, line_edit):
         """Browse for log file location."""

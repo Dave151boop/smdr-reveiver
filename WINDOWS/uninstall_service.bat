@@ -26,6 +26,7 @@ set "SERVICE_EXE=SMDRService.exe"
 set "INSTALL_DIR=%ProgramFiles%\SMDR Receiver"
 set "CONFIG_FILE=%INSTALL_DIR%\smdr_config.json"
 set "DATA_DIR=%ProgramData%\SMDR Receiver"
+set "DEFAULT_VIEWER_PORT=7010"
 
 cls
 echo ============================================
@@ -66,6 +67,10 @@ if exist "%CONFIG_FILE%" (
     set "PORT_LINE=%%a"
     set "PORT=!PORT_LINE:~0,-1!"
   )
+  for /f "tokens=2 delims=: " %%a in ('type "%CONFIG_FILE%" ^| findstr /i "viewer_port"') do (
+    set "VIEWER_PORT_LINE=%%a"
+    set "VIEWER_PORT=!VIEWER_PORT_LINE:~0,-1!"
+  )
 )
 
 REM Remove firewall rules (try default port and configured port)
@@ -74,6 +79,10 @@ if defined PORT (
   netsh advfirewall firewall delete rule name="SMDR Receiver (TCP !PORT!)" >nul 2>&1
 )
 netsh advfirewall firewall delete rule name="SMDR Receiver (TCP 7004)" >nul 2>&1
+if defined VIEWER_PORT (
+  netsh advfirewall firewall delete rule name="SMDR Viewer Broadcast (TCP !VIEWER_PORT!)" >nul 2>&1
+)
+netsh advfirewall firewall delete rule name="SMDR Viewer Broadcast (TCP %DEFAULT_VIEWER_PORT%)" >nul 2>&1
 echo.
 
 REM Ask about removing files
