@@ -1,0 +1,34 @@
+{
+    "port": 7004,
+    "viewer_port": 7010,
+    "log_file": "C:\\ProgramData\\SMDR Receiver\\smdr.log",
+    "auto_start": true,
+    "log_directory": "C:\\ProgramData\\SMDR Receiver",
+    "service_host": "localhost",
+    "use_source_colors": false,
+    "source_colors": [
+        {
+            "ip": "192.168.10.3",
+            "color1": "#ff00ff",
+            "color2": "#ec00ec",
+            "name": "Main"
+        },
+        {
+            "ip": "192.168.10.250",
+            "color1": "#18fa32",
+            "color2": "#11b622"
+        },
+        {
+            "ip": "192.168.10.246",
+            "color1": "#99cbfa",
+            "color2": "#6a8dad"
+        }
+    ],
+    "source_names": [
+        {
+            "ip": "192.168.10.3",
+            "name": "Main"
+        }
+    ],
+    "use_source_names": true
+}
