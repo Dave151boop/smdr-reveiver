@@ -9,8 +9,8 @@ import threading
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from PySide6.QtCore import QTimer, Qt, QFileSystemWatcher
-from PySide6.QtGui import QAction, QColor, QPalette, QBrush, QIcon
+from PySide6.QtCore import QTimer, Qt, QFileSystemWatcher, QSettings, QByteArray, QDateTime, QDate, QTime
+from PySide6.QtGui import QAction, QColor, QPalette, QBrush, QIcon, QShortcut, QKeySequence, QClipboard
 from PySide6.QtWidgets import (
     QMainWindow,
     QApplication,
@@ -32,9 +32,15 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QColorDialog,
+    QMenu,
+    QDateTimeEdit,
+    QCheckBox,
+    QComboBox,
 )
 import csv
 from io import StringIO
+import base64
+import ctypes
 
 from smdr.server import FIELD_NAMES
 from smdr.config import SMDRConfig
@@ -94,9 +100,25 @@ class SMDRViewer(QMainWindow):
                 self._source_names.append({'ip': str(c.get('ip')).strip(), 'name': str(c.get('name')).strip()[:20]})
         self._source_names = self._source_names[:10]
         self._rebuild_name_map()
+
+        # Row limit for memory management
+        self._max_rows = int(self.config.get('max_rows', 10000))
+
+        # Auto-reconnect settings
+        self._auto_reconnect = bool(self.config.get('auto_reconnect', True))
+        self._reconnect_timer = None
+
+        # Last update timestamp
+        self._last_update_time = None
+
+        # Settings for window state and column widths
+        self._settings = QSettings("SMDR", "Viewer")
         
         # Create UI
         self._create_ui()
+        
+        # Restore window geometry and column widths
+        self._restore_window_state()
         
         # File watcher to detect changes
         self.file_watcher = QFileSystemWatcher()
@@ -125,10 +147,19 @@ class SMDRViewer(QMainWindow):
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(True)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_header_context_menu)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self._apply_shading_color()
+        
+        # Context menu for table
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         
         # Green shading
         try:
@@ -158,6 +189,52 @@ class SMDRViewer(QMainWindow):
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(search_btn)
         search_layout.addWidget(clear_btn)
+
+        # Quick filters bar
+        filters_widget = QWidget()
+        filters_layout = QHBoxLayout(filters_widget)
+        filters_layout.setContentsMargins(0, 0, 0, 0)
+
+        filters_layout.addWidget(QLabel("Filters:"))
+
+        # Direction filter
+        filters_layout.addWidget(QLabel("Direction:"))
+        self.filter_direction = QComboBox()
+        self.filter_direction.addItems(["All", "INBOUND", "OUTBOUND"])
+        filters_layout.addWidget(self.filter_direction)
+
+        # Extension filter (matches device/name columns)
+        filters_layout.addWidget(QLabel("Extension:"))
+        self.filter_extension = QLineEdit()
+        self.filter_extension.setPlaceholderText("e.g. 201 or E201")
+        filters_layout.addWidget(self.filter_extension)
+
+        # Date range filter
+        self.filter_enable_dates = QCheckBox("Date Range")
+        filters_layout.addWidget(self.filter_enable_dates)
+        self.filter_start = QDateTimeEdit()
+        self.filter_start.setDisplayFormat("yyyy/MM/dd HH:mm:ss")
+        self.filter_start.setCalendarPopup(True)
+        self.filter_end = QDateTimeEdit()
+        self.filter_end.setDisplayFormat("yyyy/MM/dd HH:mm:ss")
+        self.filter_end.setCalendarPopup(True)
+        # Default to today's full range: 00:00:01 to 23:59:59
+        try:
+            today = QDate.currentDate()
+            self.filter_start.setDateTime(QDateTime(today, QTime(0, 0, 1)))
+            self.filter_end.setDateTime(QDateTime(today, QTime(23, 59, 59)))
+        except Exception:
+            pass
+        filters_layout.addWidget(self.filter_start)
+        filters_layout.addWidget(QLabel("to"))
+        filters_layout.addWidget(self.filter_end)
+
+        apply_filters_btn = QPushButton("Apply Filters")
+        apply_filters_btn.clicked.connect(self._apply_filters)
+        clear_filters_btn = QPushButton("Clear Filters")
+        clear_filters_btn.clicked.connect(self._clear_filters)
+        filters_layout.addWidget(apply_filters_btn)
+        filters_layout.addWidget(clear_filters_btn)
         
         self._search_matches = []
         self._current_search_index = -1
@@ -174,6 +251,7 @@ class SMDRViewer(QMainWindow):
         layout = QVBoxLayout(central)
         layout.addWidget(self.header_label)
         layout.addWidget(search_widget)
+        layout.addWidget(filters_widget)
         layout.addWidget(self.table)
         layout.addWidget(self.status)
         self.setCentralWidget(central)
@@ -189,6 +267,15 @@ class SMDRViewer(QMainWindow):
         export_action.triggered.connect(self._export_csv)
         file_menu.addAction(export_action)
         
+        # Preferences import/export
+        import_prefs_action = QAction("Import Preferences...", self)
+        import_prefs_action.triggered.connect(self._import_preferences)
+        file_menu.addAction(import_prefs_action)
+
+        export_prefs_action = QAction("Export Preferences...", self)
+        export_prefs_action.triggered.connect(self._export_preferences)
+        file_menu.addAction(export_prefs_action)
+        
         file_menu.addSeparator()
         
         clear_action = QAction("Clear Display", self)
@@ -201,39 +288,40 @@ class SMDRViewer(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        # View menu
+        # View menu with submenus for organization
         view_menu = self.menuBar().addMenu("View")
 
+        # Table appearance submenu
+        appearance_menu = view_menu.addMenu("Table Appearance")
         self._line_shading_action = QAction("Enable Line Shading", self, checkable=True)
         self._line_shading_action.setChecked(True)
         self._line_shading_action.triggered.connect(self._toggle_line_shading)
-        view_menu.addAction(self._line_shading_action)
+        appearance_menu.addAction(self._line_shading_action)
 
         shading_color_action = QAction("Shading Color...", self)
         shading_color_action.triggered.connect(self._choose_shading_color)
-        view_menu.addAction(shading_color_action)
+        appearance_menu.addAction(shading_color_action)
 
-        # Source color options
+        # Column manager
+        columns_action = QAction("Manage Columns...", self)
+        columns_action.triggered.connect(self._show_column_manager)
+        appearance_menu.addAction(columns_action)
+
+        # Source ID submenu (combines colors and names)
+        source_id_menu = view_menu.addMenu("Source ID")
         self._use_source_colors_action = QAction("Use Source Colors", self, checkable=True)
         self._use_source_colors_action.setChecked(self._use_source_colors)
         self._use_source_colors_action.triggered.connect(self._toggle_source_colors)
-        view_menu.addAction(self._use_source_colors_action)
+        source_id_menu.addAction(self._use_source_colors_action)
 
-        source_colors_action = QAction("Configure Source Colors...", self)
-        source_colors_action.triggered.connect(self._configure_source_colors)
-        view_menu.addAction(source_colors_action)
-
-        view_menu.addSeparator()
-
-        # Source name options
         self._use_source_names_action = QAction("Use Source Names", self, checkable=True)
         self._use_source_names_action.setChecked(self._use_source_names)
         self._use_source_names_action.triggered.connect(self._toggle_source_names)
-        view_menu.addAction(self._use_source_names_action)
+        source_id_menu.addAction(self._use_source_names_action)
 
-        source_names_action = QAction("Configure Source Names...", self)
-        source_names_action.triggered.connect(self._configure_source_names)
-        view_menu.addAction(source_names_action)
+        source_colors_action = QAction("Configure Source ID...", self)
+        source_colors_action.triggered.connect(self._configure_source_colors)
+        source_id_menu.addAction(source_colors_action)
         
         # Service menu
         service_menu = self.menuBar().addMenu("Service")
@@ -267,11 +355,9 @@ class SMDRViewer(QMainWindow):
         about_action = QAction("About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
-
-        help_menu.addSeparator()
-        debug_action = QAction("Debug - Send Test Data", self)
-        debug_action.triggered.connect(self._show_debug_sender)
-        help_menu.addAction(debug_action)
+        
+        # Keyboard shortcuts
+        self._setup_shortcuts()
         
         self._update_status()
         
@@ -384,6 +470,290 @@ class SMDRViewer(QMainWindow):
             self._start_network_client()
         except Exception:
             pass
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts."""
+        # Ctrl+F - Focus search
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.activated.connect(lambda: self.search_input.setFocus())
+        
+        # F5 - Reconnect
+        reconnect_shortcut = QShortcut(QKeySequence("F5"), self)
+        reconnect_shortcut.activated.connect(self._start_network_client)
+        
+        # Ctrl+E - Export
+        export_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        export_shortcut.activated.connect(self._export_csv)
+        
+        # Ctrl+L - Clear display
+        clear_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        clear_shortcut.activated.connect(self._clear_display)
+
+    def _restore_window_state(self):
+        """Restore window geometry and column widths."""
+        try:
+            geometry = self._settings.value("geometry")
+            if geometry:
+                self.restoreGeometry(geometry)
+            # Restore header state (order, visibility, sizes)
+            header_state = self._settings.value("header_state")
+            if header_state:
+                try:
+                    if isinstance(header_state, QByteArray):
+                        self.table.horizontalHeader().restoreState(header_state)
+                    else:
+                        # QSettings may return bytes; attempt to wrap
+                        self.table.horizontalHeader().restoreState(QByteArray(header_state))
+                except Exception:
+                    pass
+            
+            # Fallback: restore individual widths
+            for col in range(self.table.columnCount()):
+                width = self._settings.value(f"column_{col}_width")
+                if width:
+                    self.table.setColumnWidth(col, int(width))
+        except Exception:
+            pass
+
+    def _save_window_state(self):
+        """Save window geometry and column widths."""
+        try:
+            self._settings.setValue("geometry", self.saveGeometry())
+            # Save header state (order, visibility, sizes)
+            self._settings.setValue("header_state", self.table.horizontalHeader().saveState())
+            
+            # Save column widths
+            for col in range(self.table.columnCount()):
+                self._settings.setValue(f"column_{col}_width", self.table.columnWidth(col))
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """Handle window close event."""
+        self._save_window_state()
+        self._stop_network_client()
+        event.accept()
+
+    def _show_context_menu(self, position):
+        """Show context menu on table right-click."""
+        menu = QMenu(self)
+        
+        # Copy cell
+        copy_cell_action = QAction("Copy Cell", self)
+        copy_cell_action.triggered.connect(self._copy_cell)
+        menu.addAction(copy_cell_action)
+        
+        # Copy row
+        copy_row_action = QAction("Copy Row", self)
+        copy_row_action.triggered.connect(self._copy_row)
+        menu.addAction(copy_row_action)
+        
+        menu.addSeparator()
+        
+        # Export selected rows
+        export_selected_action = QAction("Export Selected Rows...", self)
+        export_selected_action.triggered.connect(self._export_selected_rows)
+        menu.addAction(export_selected_action)
+        
+        menu.exec_(self.table.viewport().mapToGlobal(position))
+
+    def _show_header_context_menu(self, position):
+        """Show context menu on header right-click, including column manager."""
+        header = self.table.horizontalHeader()
+        menu = QMenu(self)
+
+        col = header.logicalIndexAt(position)
+
+        manage_action = QAction("Manage Columns...", self)
+        manage_action.triggered.connect(self._show_column_manager)
+        menu.addAction(manage_action)
+
+        if col >= 0:
+            # Hide current column
+            hide_action = QAction(f"Hide '{self.table.horizontalHeaderItem(col).text()}'", self)
+            hide_action.triggered.connect(lambda: self.table.setColumnHidden(col, True))
+            menu.addAction(hide_action)
+
+        show_all_action = QAction("Show All Columns", self)
+        def _show_all():
+            for c in range(self.table.columnCount()):
+                self.table.setColumnHidden(c, False)
+        show_all_action.triggered.connect(_show_all)
+        menu.addAction(show_all_action)
+
+        menu.exec_(header.viewport().mapToGlobal(position))
+
+    def _copy_cell(self):
+        """Copy current cell to clipboard."""
+        try:
+            current = self.table.currentItem()
+            if current:
+                QApplication.clipboard().setText(current.text())
+        except Exception:
+            pass
+
+    def _copy_row(self):
+        """Copy current row to clipboard."""
+        try:
+            row = self.table.currentRow()
+            if row >= 0:
+                row_data = []
+                for col in range(self.table.columnCount()):
+                    item = self.table.item(row, col)
+                    row_data.append(item.text() if item else '')
+                QApplication.clipboard().setText('\t'.join(row_data))
+        except Exception:
+            pass
+
+    def _show_column_manager(self):
+        """Show a dialog to toggle column visibility and reset layout."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Columns")
+        dialog.resize(500, 500)
+        form = QFormLayout(dialog)
+
+        # Build a list of checkboxes for each column
+        checkboxes = []
+        for col in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(col)
+            title = header_item.text() if header_item else f"Column {col}"
+            cb = QCheckBox(title)
+            cb.setChecked(not self.table.isColumnHidden(col))
+            checkboxes.append((col, cb))
+            form.addRow(cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        reset_btn = QPushButton("Reset Layout")
+        buttons.addButton(reset_btn, QDialogButtonBox.ResetRole)
+        form.addRow(buttons)
+
+        def on_reset():
+            try:
+                # Show all columns
+                for col, cb in checkboxes:
+                    cb.setChecked(True)
+                # Reset header state: clear any saved state
+                self.table.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
+                # Restore default order by moving sections back to logical order
+                header = self.table.horizontalHeader()
+                for logical in range(self.table.columnCount() - 1, -1, -1):
+                    header.moveSection(header.visualIndex(logical), logical)
+            except Exception:
+                pass
+
+        reset_btn.clicked.connect(on_reset)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            # Apply visibility
+            for col, cb in checkboxes:
+                self.table.setColumnHidden(col, not cb.isChecked())
+            # Save header state
+            self._save_window_state()
+
+    def _export_selected_rows(self):
+        """Export selected rows to CSV."""
+        selected_rows = set(index.row() for index in self.table.selectedIndexes())
+        if not selected_rows:
+            QMessageBox.information(self, "No Selection", "No rows selected.")
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(self, "Export Selected Rows", "smdr_selected.csv", "CSV Files (*.csv)")
+        if path:
+            try:
+                with open(path, "w", newline='', encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    # Write headers
+                    writer.writerow(['Source IP'] + FIELD_NAMES)
+                    # Write selected rows
+                    for row in sorted(selected_rows):
+                        row_data = []
+                        for col in range(self.table.columnCount()):
+                            item = self.table.item(row, col)
+                            if col == 0:
+                                # Export actual IP, not displayed name
+                                underlying_ip = item.data(Qt.UserRole) if item else ''
+                                row_data.append(underlying_ip or item.text() if item else '')
+                            else:
+                                row_data.append(item.text() if item else '')
+                        writer.writerow(row_data)
+                QMessageBox.information(self, "Success", f"Exported {len(selected_rows)} rows to {path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not export CSV: {e}")
+
+    def _export_preferences(self):
+        """Export color/name mappings and column layout to a JSON file."""
+        path, _ = QFileDialog.getSaveFileName(self, "Export Preferences", "smdr_prefs.json", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            # Gather header state
+            header_state = self.table.horizontalHeader().saveState()
+            header_state_b64 = base64.b64encode(bytes(header_state)).decode('ascii') if header_state else ''
+
+            prefs = {
+                'use_source_colors': self._use_source_colors,
+                'source_colors': self._source_colors,
+                'use_source_names': self._use_source_names,
+                'source_names': self._source_names,
+                'shading_color': self._shading_color,
+                'max_rows': self._max_rows,
+                'auto_reconnect': self._auto_reconnect,
+                'header_state': header_state_b64,
+            }
+            import json
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(prefs, f, indent=2)
+            QMessageBox.information(self, "Preferences", f"Exported preferences to {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Preferences", f"Failed to export: {e}")
+
+    def _import_preferences(self):
+        """Import preferences from a JSON file and apply them."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import Preferences", "", "JSON Files (*.json)")
+        if not path:
+            return
+        try:
+            import json
+            with open(path, 'r', encoding='utf-8') as f:
+                prefs = json.load(f)
+            # Apply colors/names
+            self._use_source_colors = bool(prefs.get('use_source_colors', self._use_source_colors))
+            self._source_colors = list(prefs.get('source_colors', self._source_colors))
+            self._rebuild_color_map()
+            self._use_source_names = bool(prefs.get('use_source_names', self._use_source_names))
+            self._source_names = list(prefs.get('source_names', self._source_names))
+            self._rebuild_name_map()
+            self._shading_color = prefs.get('shading_color', self._shading_color)
+            self._max_rows = int(prefs.get('max_rows', self._max_rows))
+            self._auto_reconnect = bool(prefs.get('auto_reconnect', self._auto_reconnect))
+            # Restore header state
+            header_state_b64 = prefs.get('header_state', '')
+            if header_state_b64:
+                try:
+                    raw = base64.b64decode(header_state_b64)
+                    self.table.horizontalHeader().restoreState(QByteArray(raw))
+                except Exception:
+                    pass
+            # Update menu checks and visuals
+            self._use_source_colors_action.setChecked(self._use_source_colors)
+            self._use_source_names_action.setChecked(self._use_source_names)
+            self._apply_shading_color()
+            self._refresh_source_name_display()
+            self._recolor_all_rows()
+            # Persist to config
+            try:
+                self.config.set('use_source_colors', self._use_source_colors)
+                self.config.set('source_colors', self._source_colors)
+                self.config.set('use_source_names', self._use_source_names)
+                self.config.set('source_names', self._source_names)
+                self.config.save_config()
+            except Exception:
+                pass
+            QMessageBox.information(self, "Preferences", f"Imported preferences from {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Preferences", f"Failed to import: {e}")
             
     def _process_line(self, line):
         """Process a line from the log file."""
@@ -418,6 +788,11 @@ class SMDRViewer(QMainWindow):
             
     def _add_table_row(self, source_ip, parsed):
         """Add a row to the table with source IP."""
+        # Enforce row limit
+        if self.table.rowCount() >= self._max_rows:
+            self.table.removeRow(0)
+            self.lines_displayed -= 1
+        
         row = self.table.rowCount()
         self.table.insertRow(row)
         
@@ -433,8 +808,21 @@ class SMDRViewer(QMainWindow):
         # Remaining columns: FIELD_NAMES data
         for col_index in range(len(FIELD_NAMES)):
             val = parsed[col_index] if col_index < len(parsed) else ''
-            item = QTableWidgetItem(str(val))
+            text = str(val)
+            item: QTableWidgetItem
+            # Map Direction: 'I' → 'INBOUND', 'O' → 'OUTBOUND' (display only)
+            if col_index == 4:  # FIELD_NAMES[4] == 'direction'
+                raw = (str(val).strip().upper())
+                display = 'INBOUND' if raw == 'I' else ('OUTBOUND' if raw == 'O' else text)
+                item = QTableWidgetItem(display)
+                # Preserve raw code in UserRole for filtering/exports if needed
+                item.setData(Qt.UserRole, raw if raw in ('I', 'O') else raw)
+            else:
+                item = QTableWidgetItem(text)
             self.table.setItem(row, col_index + 1, item)
+        
+        # Update last update time
+        self._last_update_time = datetime.now()
         
         # Apply source IP color if enabled (alternating between color1 and color2)
         if self._use_source_colors:
@@ -455,7 +843,13 @@ class SMDRViewer(QMainWindow):
             state = f"LOG FILE: {self.log_path.name}"
             self.header_label.setText(state)
             self.header_label.setStyleSheet("font-weight: bold; font-size: 12pt; color: blue; padding: 4px;")
-        self.status.setText(f"{state} — Lines displayed: {self.lines_displayed}")
+        
+        # Add last update timestamp
+        timestamp_str = ""
+        if self._last_update_time:
+            timestamp_str = f" — Last update: {self._last_update_time.strftime('%H:%M:%S')}"
+        
+        self.status.setText(f"{state} — Lines displayed: {self.lines_displayed}{timestamp_str}")
         
     def _open_log_file(self):
         """Open a different log file."""
@@ -484,14 +878,19 @@ class SMDRViewer(QMainWindow):
             try:
                 with open(path, "w", newline='', encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    # Write headers
-                    writer.writerow(FIELD_NAMES)
+                    # Write headers (with Source IP instead of name)
+                    writer.writerow(['Source IP'] + FIELD_NAMES)
                     # Write rows
                     for row in range(self.table.rowCount()):
                         row_data = []
                         for col in range(self.table.columnCount()):
                             item = self.table.item(row, col)
-                            row_data.append(item.text() if item else '')
+                            if col == 0:
+                                # Export actual IP, not displayed name
+                                underlying_ip = item.data(Qt.UserRole) if item else ''
+                                row_data.append(underlying_ip or item.text() if item else '')
+                            else:
+                                row_data.append(item.text() if item else '')
                         writer.writerow(row_data)
                 QMessageBox.information(self, "Success", f"Exported {self.table.rowCount()} rows to {path}")
             except Exception as e:
@@ -609,6 +1008,97 @@ class SMDRViewer(QMainWindow):
                 self._apply_row_color(row, color_hex)
             else:
                 self._clear_row_color(row)
+
+    def _column_index_by_header(self, header_title: str) -> int:
+        """Find current column index by its header title (case-insensitive). Returns -1 if not found."""
+        target = header_title.strip().lower()
+        for col in range(self.table.columnCount()):
+            item = self.table.horizontalHeaderItem(col)
+            if item and item.text().strip().lower() == target:
+                return col
+        return -1
+
+    def _apply_filters(self):
+        """Apply quick filters to hide/show rows without altering data."""
+        # Normalize direction filter choice
+        dir_choice_ui = (self.filter_direction.currentText() or '').strip().upper()
+        if dir_choice_ui == 'INBOUND':
+            direction_choice = 'I'
+        elif dir_choice_ui == 'OUTBOUND':
+            direction_choice = 'O'
+        else:
+            direction_choice = ''
+        ext_text = self.filter_extension.text().strip().lower()
+        use_dates = self.filter_enable_dates.isChecked()
+        start_dt = self.filter_start.dateTime().toPython() if use_dates else None
+        end_dt = self.filter_end.dateTime().toPython() if use_dates else None
+
+        # Sanity check date range
+        if use_dates and start_dt and end_dt and start_dt > end_dt:
+            QMessageBox.warning(self, "Filters", "Start date/time must be earlier than end date/time.")
+            return
+
+        # Resolve column indices by header text
+        col_direction = self._column_index_by_header('Direction')
+        col_device = self._column_index_by_header('Party1 Device')
+        if col_device == -1:
+            col_device = self._column_index_by_header('Caller')
+        col_datetime = self._column_index_by_header('Call Start Time')
+
+        for row in range(self.table.rowCount()):
+            hide = False
+            # Direction filter
+            if direction_choice in ('I', 'O') and col_direction != -1:
+                it = self.table.item(row, col_direction)
+                # Prefer raw code from UserRole; fallback to mapping displayed text
+                raw_dir = (it.data(Qt.UserRole) if it else None)
+                if not raw_dir:
+                    disp = (it.text().strip().upper() if it and it.text() else '')
+                    raw_dir = 'I' if disp == 'INBOUND' else ('O' if disp == 'OUTBOUND' else disp)
+                if (raw_dir or '').upper() != direction_choice:
+                    hide = True
+
+            # Extension filter (contains)
+            if not hide and ext_text:
+                matched = False
+                if col_device != -1:
+                    it = self.table.item(row, col_device)
+                    if it and ext_text in it.text().strip().lower():
+                        matched = True
+                # Also check the first column name/IP
+                if not matched:
+                    ip_item = self.table.item(row, 0)
+                    if ip_item and ext_text in (ip_item.text().lower()):
+                        matched = True
+                if not matched:
+                    hide = True
+
+            # Date range filter
+            if not hide and use_dates and col_datetime != -1:
+                it = self.table.item(row, col_datetime)
+                try:
+                    # Expect format like YYYY/MM/DD HH:MM:SS
+                    from datetime import datetime as _dt
+                    val = _dt.strptime(it.text().strip(), '%Y/%m/%d %H:%M:%S') if it and it.text().strip() else None
+                except Exception:
+                    val = None
+                if val is None:
+                    hide = True
+                else:
+                    if start_dt and val < start_dt:
+                        hide = True
+                    if end_dt and val > end_dt:
+                        hide = True
+
+            self.table.setRowHidden(row, hide)
+
+    def _clear_filters(self):
+        """Clear filters and show all rows."""
+        self.filter_direction.setCurrentIndex(0)
+        self.filter_extension.clear()
+        self.filter_enable_dates.setChecked(False)
+        for row in range(self.table.rowCount()):
+            self.table.setRowHidden(row, False)
 
     def _toggle_source_names(self):
         """Enable/disable showing mapped source names instead of IPs."""
@@ -935,8 +1425,16 @@ class SMDRViewer(QMainWindow):
             for row in range(self.table.rowCount()):
                 for col in range(self.table.columnCount()):
                     item = self.table.item(row, col)
-                    if item and search_term_lower in item.text().lower():
-                        self._search_matches.append((row, col, search_term_lower))
+                    if item:
+                        # Check displayed text
+                        if search_term_lower in item.text().lower():
+                            self._search_matches.append((row, col, search_term_lower))
+                            continue
+                        # For first column, also check underlying IP (UserRole)
+                        if col == 0:
+                            underlying_ip = item.data(Qt.UserRole)
+                            if underlying_ip and search_term_lower in str(underlying_ip).lower():
+                                self._search_matches.append((row, col, search_term_lower))
             self._current_search_index = -1
         
         if not self._search_matches:
@@ -1059,8 +1557,115 @@ class SMDRViewer(QMainWindow):
         if path:
             line_edit.setText(path)
     
+    def _is_admin(self):
+        """Check if the current process is running with administrator privileges."""
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin()
+        except:
+            return False
+    
+    def _run_elevated_command(self, command_args):
+        """
+        Run a command with elevated privileges using UAC prompt.
+        
+        Args:
+            command_args: List of command arguments (e.g., ["net", "stop", "SMDRReceiver"])
+        
+        Returns:
+            tuple: (success: bool, error_message: str or None)
+        """
+        try:
+            # Create a batch file to run the command
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.bat', delete=False) as bat_file:
+                bat_path = bat_file.name
+                # Write command to batch file
+                bat_file.write('@echo off\n')
+                bat_file.write(' '.join(command_args) + '\n')
+                bat_file.write('exit %ERRORLEVEL%\n')
+            
+            # Run the batch file with elevation using ShellExecute
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None,           # hwnd
+                "runas",        # operation (triggers UAC)
+                "cmd.exe",      # file
+                f'/c "{bat_path}"',  # parameters
+                None,           # directory
+                1               # show window (SW_SHOWNORMAL)
+            )
+            
+            # ShellExecuteW returns a value > 32 on success
+            if ret <= 32:
+                # Clean up batch file
+                try:
+                    Path(bat_path).unlink()
+                except:
+                    pass
+                return False, f"Failed to elevate privileges (error code: {ret}). User may have declined UAC prompt."
+            
+            # Wait a bit for the command to complete
+            time.sleep(3)
+            
+            # Clean up batch file
+            try:
+                Path(bat_path).unlink()
+            except:
+                pass
+            
+            return True, None
+            
+        except Exception as e:
+            return False, f"Error running elevated command: {e}"
+    
     def _restart_service(self):
         """Restart the SMDR service."""
+        # Check if we're already running as admin
+        if not self._is_admin():
+            # Ask user if they want to elevate
+            reply = QMessageBox.question(
+                self,
+                "Administrator Privileges Required",
+                "Stopping and starting the SMDRReceiver service requires administrator privileges.\n\n"
+                "Would you like to elevate privileges and continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply != QMessageBox.Yes:
+                return False
+            
+            # Try to run elevated commands
+            # Stop service
+            success, error = self._run_elevated_command(["net", "stop", "SMDRReceiver"])
+            if not success:
+                QMessageBox.warning(
+                    self,
+                    "Service Control",
+                    f"Failed to stop service:\n{error}"
+                )
+                return False
+            
+            # Small delay
+            time.sleep(2)
+            
+            # Start service
+            success, error = self._run_elevated_command(["net", "start", "SMDRReceiver"])
+            if not success:
+                QMessageBox.warning(
+                    self,
+                    "Service Control",
+                    f"Failed to start service:\n{error}"
+                )
+                return False
+            
+            QMessageBox.information(
+                self,
+                "Service Control",
+                "Service restarted successfully."
+            )
+            return True
+        
+        # We're already admin, run commands directly
         try:
             # Stop service
             result = subprocess.run(
@@ -1074,7 +1679,7 @@ class SMDRViewer(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Service Control",
-                    f"Failed to stop service:\n{result.stderr}\n\nRun the viewer as Administrator (right-click → Run as administrator)."
+                    f"Failed to stop service:\n{result.stderr}"
                 )
                 return False
             
@@ -1093,46 +1698,103 @@ class SMDRViewer(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Service Control",
-                    f"Failed to start service:\n{result.stderr}\n\nRun the viewer as Administrator (right-click → Run as administrator)."
+                    f"Failed to start service:\n{result.stderr}"
                 )
                 return False
             
+            QMessageBox.information(
+                self,
+                "Service Control",
+                "Service restarted successfully."
+            )
             return True
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error restarting service:\n{e}")
             return False
+
+    def _query_service_status(self, timeout: int = 15):
+        """
+        Query the SMDRReceiver service status with robust fallbacks.
+
+        Returns tuple: (success: bool, status: str, details: str, error: str | None)
+        status in {"Running", "Stopped", "Unknown"}
+        """
+        service_name = "SMDRReceiver"
+        # Try sc.exe first
+        try:
+            result = subprocess.run(
+                ["sc", "query", service_name],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            if result.returncode == 0:
+                out = result.stdout or ""
+                if "RUNNING" in out:
+                    return True, "Running", out, None
+                if "STOPPED" in out:
+                    return True, "Stopped", out, None
+                return True, "Unknown", out, None
+            # Non-zero return: capture stderr and fall through to PS
+            sc_err = (result.stderr or "").strip()
+        except subprocess.TimeoutExpired as te:
+            sc_err = f"sc query timed out after {timeout}s"
+        except Exception as e:
+            sc_err = f"sc query failed: {e}"
+
+        # Fallback to PowerShell Get-Service (no admin required)
+        try:
+            ps_cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"$s = Get-Service -Name '{service_name}' -ErrorAction Stop;"
+                    "Write-Output ('Status: ' + $s.Status);"
+                    "Write-Output ('Name: ' + $s.Name);"
+                    "Write-Output ('DisplayName: ' + $s.DisplayName)"
+                ),
+            ]
+            result = subprocess.run(
+                ps_cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(10, timeout // 2)
+            )
+            if result.returncode == 0:
+                out = (result.stdout or "").strip()
+                status = "Unknown"
+                if "Status: Running" in out:
+                    status = "Running"
+                elif "Status: Stopped" in out:
+                    status = "Stopped"
+                return True, status, out, None
+            ps_err = (result.stderr or "").strip() or (result.stdout or "").strip()
+            return False, "Unknown", "", f"PowerShell Get-Service failed: {ps_err}\n(sc) {sc_err}"
+        except subprocess.TimeoutExpired:
+            return False, "Unknown", "", f"PowerShell Get-Service timed out. (sc) {sc_err}"
+        except Exception as e:
+            return False, "Unknown", "", f"PowerShell Get-Service error: {e}\n(sc) {sc_err}"
     
     def _show_service_status(self):
         """Show the current service status."""
         try:
-            result = subprocess.run(
-                ["sc", "query", "SMDRReceiver"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            if result.returncode == 0:
-                # Parse status
-                status_text = result.stdout
-                if "RUNNING" in status_text:
-                    status = "Running"
+            success, status, details, error = self._query_service_status(timeout=15)
+            if success:
+                if status == "Running":
                     icon = QMessageBox.Information
-                elif "STOPPED" in status_text:
-                    status = "Stopped"
+                elif status == "Stopped":
                     icon = QMessageBox.Warning
                 else:
-                    status = "Unknown"
                     icon = QMessageBox.Information
-                
+
                 msg = QMessageBox(self)
                 msg.setIcon(icon)
                 msg.setWindowTitle("Service Status")
                 msg.setText(f"SMDR Receiver Service is: {status}")
-                msg.setDetailedText(status_text)
-                
-                # Add current configuration info
+                msg.setDetailedText(details)
+
                 info = (
                     f"\nCurrent Configuration:\n"
                     f"Port: {self.config.get_port()}\n"
@@ -1144,9 +1806,9 @@ class SMDRViewer(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Service Status",
-                    f"Could not query service status:\n{result.stderr}"
+                    f"Could not query service status:\n{error}"
                 )
-                
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error checking service status:\n{e}")
 
@@ -1283,7 +1945,52 @@ class SMDRViewer(QMainWindow):
             pass
         finally:
             # Auto-switch to file mode on disconnect on the GUI thread
-            QTimer.singleShot(0, self._stop_network_client)
+            QTimer.singleShot(0, self._handle_network_disconnect)
+
+    def _handle_network_disconnect(self):
+        """Handle network disconnection with optional auto-reconnect."""
+        self._stop_network_client()
+        
+        if self._auto_reconnect and not self._reconnect_timer:
+            # Schedule reconnect after 5 seconds
+            self._reconnect_timer = QTimer(self)
+            self._reconnect_timer.setSingleShot(True)
+            self._reconnect_timer.timeout.connect(self._attempt_reconnect)
+            self._reconnect_timer.start(5000)
+            
+    def _attempt_reconnect(self):
+        """Attempt to reconnect after disconnect."""
+        self._reconnect_timer = None
+        try:
+            # Try to reconnect with saved settings
+            host = self.config.get('service_host', 'localhost')
+            port = self.config.get('viewer_port', 7010)
+            
+            sock = socket.create_connection((host, port), timeout=5)
+            
+            # Successful connection
+            self.connection_mode = "network"
+            try:
+                self.timer.stop()
+            except Exception:
+                pass
+            try:
+                self.file_watcher.removePaths(self.file_watcher.files())
+            except Exception:
+                pass
+
+            self._net_sock = sock
+            self._net_running.set()
+            self._net_thread = threading.Thread(target=self._network_loop, daemon=True)
+            self._net_thread.start()
+            self._update_status()
+        except Exception:
+            # Failed to reconnect, schedule another attempt if auto-reconnect is still enabled
+            if self._auto_reconnect:
+                self._reconnect_timer = QTimer(self)
+                self._reconnect_timer.setSingleShot(True)
+                self._reconnect_timer.timeout.connect(self._attempt_reconnect)
+                self._reconnect_timer.start(10000)  # Try again in 10 seconds
 
 
 def main():
