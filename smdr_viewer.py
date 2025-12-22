@@ -10,7 +10,7 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from PySide6.QtCore import QTimer, Qt, QFileSystemWatcher
-from PySide6.QtGui import QAction, QColor, QPalette
+from PySide6.QtGui import QAction, QColor, QPalette, QBrush, QIcon
 from PySide6.QtWidgets import (
     QMainWindow,
     QApplication,
@@ -46,23 +46,54 @@ class SMDRViewer(QMainWindow):
         super().__init__()
         self.setWindowTitle("SMDR Viewer (Service Client)")
         self.resize(900, 600)
+        app_icon = self._load_app_icon()
+        if app_icon:
+            try:
+                self.setWindowIcon(app_icon)
+                app = QApplication.instance()
+                if app:
+                    app.setWindowIcon(app_icon)
+            except Exception:
+                pass
         
         # Load configuration
         self.config = SMDRConfig()
         self._shading_color = '#eaf8ea'
         
-        # Connection/file mode tracking
-        self.connection_mode = "file"  # "file" or "network"
-
-        # File tracking
+        # File tracking (will resolve to dated SMDRdataMMDDYY.log if missing)
         self.log_path = self.config.get_log_file()
+        self._resolve_log_path()
         self.last_position = 0
         self.lines_displayed = 0
+
+        # Connection/file mode tracking
+        self.connection_mode = "file"  # "file" or "network"
 
         # Network client state
         self._net_sock = None
         self._net_thread = None
         self._net_running = threading.Event()
+
+        # Source IP color mapping
+        self._use_source_colors = bool(self.config.get('use_source_colors', False))
+        # Expect a list of {"ip": str, "color1": "#RRGGBB", "color2": "#RRGGBB"}
+        saved_colors = self.config.get('source_colors', []) or []
+        self._source_colors = [c for c in saved_colors if isinstance(c, dict) and c.get('ip') and c.get('color1') and c.get('color2')]
+        # Normalize to max 10 entries
+        self._source_colors = self._source_colors[:10]
+        self._rebuild_color_map()
+        # Track row count per IP for alternating
+        self._source_ip_count = {}
+
+        # Source IP naming
+        self._use_source_names = bool(self.config.get('use_source_names', False))
+        saved_names = self.config.get('source_names', []) or []
+        self._source_names = []
+        for c in saved_names:
+            if isinstance(c, dict) and c.get('ip') and c.get('name'):
+                self._source_names.append({'ip': str(c.get('ip')).strip(), 'name': str(c.get('name')).strip()[:20]})
+        self._source_names = self._source_names[:10]
+        self._rebuild_name_map()
         
         # Create UI
         self._create_ui()
@@ -80,16 +111,18 @@ class SMDRViewer(QMainWindow):
         
         # Load existing data
         self._load_existing_data()
+
+        # Prompt to connect to service on launch
+        self._launch_prompt_shown = False
+        QTimer.singleShot(0, self._prompt_connect_on_launch)
         
     def _create_ui(self):
         """Create the user interface."""
-        # Connection status header
-        self.header_label = QLabel("Disconnected from SMDR Server")
-        self.header_label.setStyleSheet("font-weight: bold; color: red;")
-        # Table widget
+        # Table widget with Source IP/Name as first column
         self.table = QTableWidget()
-        self.table.setColumnCount(len(FIELD_NAMES))
-        self.table.setHorizontalHeaderLabels([n.replace('_', ' ').title() for n in FIELD_NAMES])
+        self.table.setColumnCount(len(FIELD_NAMES) + 1)
+        headers = ['Source IP/Name'] + [n.replace('_', ' ').title() for n in FIELD_NAMES]
+        self.table.setHorizontalHeaderLabels(headers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -131,7 +164,11 @@ class SMDRViewer(QMainWindow):
         
         # Status bar
         self.status = QLabel()
-        
+
+        # Connection header (prominent status)
+        self.header_label = QLabel("Not Connected")
+        self.header_label.setStyleSheet("font-weight: bold; font-size: 12pt; color: red; padding: 4px;")
+
         # Layout
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -175,6 +212,28 @@ class SMDRViewer(QMainWindow):
         shading_color_action = QAction("Shading Color...", self)
         shading_color_action.triggered.connect(self._choose_shading_color)
         view_menu.addAction(shading_color_action)
+
+        # Source color options
+        self._use_source_colors_action = QAction("Use Source Colors", self, checkable=True)
+        self._use_source_colors_action.setChecked(self._use_source_colors)
+        self._use_source_colors_action.triggered.connect(self._toggle_source_colors)
+        view_menu.addAction(self._use_source_colors_action)
+
+        source_colors_action = QAction("Configure Source Colors...", self)
+        source_colors_action.triggered.connect(self._configure_source_colors)
+        view_menu.addAction(source_colors_action)
+
+        view_menu.addSeparator()
+
+        # Source name options
+        self._use_source_names_action = QAction("Use Source Names", self, checkable=True)
+        self._use_source_names_action.setChecked(self._use_source_names)
+        self._use_source_names_action.triggered.connect(self._toggle_source_names)
+        view_menu.addAction(self._use_source_names_action)
+
+        source_names_action = QAction("Configure Source Names...", self)
+        source_names_action.triggered.connect(self._configure_source_names)
+        view_menu.addAction(source_names_action)
         
         # Service menu
         service_menu = self.menuBar().addMenu("Service")
@@ -184,7 +243,7 @@ class SMDRViewer(QMainWindow):
         service_menu.addAction(config_action)
         
         service_menu.addSeparator()
-        
+
         connect_action = QAction("Connect to Service", self)
         connect_action.triggered.connect(self._start_network_client)
         service_menu.addAction(connect_action)
@@ -194,7 +253,7 @@ class SMDRViewer(QMainWindow):
         service_menu.addAction(disconnect_action)
 
         service_menu.addSeparator()
-
+        
         restart_action = QAction("Restart Service", self)
         restart_action.triggered.connect(self._restart_service)
         service_menu.addAction(restart_action)
@@ -219,6 +278,8 @@ class SMDRViewer(QMainWindow):
     def _load_existing_data(self):
         """Load existing data from log file."""
         if not self.log_path.exists():
+            self._resolve_log_path()
+        if not self.log_path.exists():
             self.status.setText(f"Waiting for log file: {self.log_path}")
             return
             
@@ -239,6 +300,21 @@ class SMDRViewer(QMainWindow):
         """Check for new data in the log file."""
         if self.connection_mode == "network":
             return  # network mode reads from socket
+        
+        # Check if log file rolled to a new date
+        if not self.log_path.exists():
+            self._resolve_log_path()
+        
+        # Also periodically check for newer dated logs
+        try:
+            base_dir = self.log_path.parent if self.log_path.parent else Path.cwd()
+            candidates = sorted(base_dir.glob("SMDRdata*.log"))
+            if candidates and candidates[-1] != self.log_path:
+                # Switch to newer log file
+                self._resolve_log_path()
+        except Exception:
+            pass
+        
         if not self.log_path.exists():
             return
             
@@ -253,6 +329,61 @@ class SMDRViewer(QMainWindow):
                 self._update_status()
         except Exception as e:
             pass  # File might be locked, try again later
+
+    def _resolve_log_path(self):
+        """If the configured log file is missing, pick the latest SMDRdata*.log in its directory."""
+        try:
+            old_path = self.log_path
+            base_dir = self.log_path.parent if self.log_path.parent else Path.cwd()
+            candidates = sorted(base_dir.glob("SMDRdata*.log"))
+            if candidates:
+                latest = candidates[-1]
+                if latest != self.log_path:
+                    self.log_path = latest
+                    # Update file watcher to the new path
+                    try:
+                        self.file_watcher.removePaths(self.file_watcher.files())
+                        if self.log_path.exists():
+                            self.file_watcher.addPath(str(self.log_path))
+                        self.last_position = 0
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _load_app_icon(self) -> QIcon | None:
+        """Load the application icon for window/taskbar."""
+        import sys
+        base_candidates = []
+        # When frozen, PyInstaller extracts resources under sys._MEIPASS
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            base_candidates.append(Path(meipass))
+        # Executable directory
+        if getattr(sys, "frozen", False):
+            base_candidates.append(Path(sys.executable).resolve().parent)
+        # Source locations
+        base_candidates.append(Path(__file__).resolve().parent)
+        base_candidates.append(Path.cwd())
+
+        candidates = [base / "resources" / "icon.ico" for base in base_candidates]
+        for path in candidates:
+            try:
+                if path.exists():
+                    return QIcon(str(path))
+            except Exception:
+                continue
+        return None
+
+    def _prompt_connect_on_launch(self):
+        """Show the connect dialog once at startup."""
+        if self._launch_prompt_shown:
+            return
+        self._launch_prompt_shown = True
+        try:
+            self._start_network_client()
+        except Exception:
+            pass
             
     def _process_line(self, line):
         """Process a line from the log file."""
@@ -268,6 +399,11 @@ class SMDRViewer(QMainWindow):
             addr_and_data = parts[1].split(' ', 1)
             if len(addr_and_data) < 2:
                 return
+            
+            # Extract source IP from ip:port format
+            source_addr = addr_and_data[0]  # e.g., "192.168.1.100:12345"
+            source_ip = source_addr.split(':')[0] if ':' in source_addr else source_addr
+            
             csv_data = addr_and_data[1]
             
             # Parse CSV
@@ -275,35 +411,51 @@ class SMDRViewer(QMainWindow):
             parsed = next(reader, None)
             
             if parsed:
-                self._add_table_row(parsed)
+                self._add_table_row(source_ip, parsed)
                 self.lines_displayed += 1
         except Exception:
             pass  # Skip malformed lines
             
-    def _add_table_row(self, parsed):
-        """Add a row to the table."""
+    def _add_table_row(self, source_ip, parsed):
+        """Add a row to the table with source IP."""
         row = self.table.rowCount()
         self.table.insertRow(row)
+        
+        # First column: Source IP
+        display_ip = str(source_ip)
+        if self._use_source_names:
+            name = self._name_map.get(display_ip, display_ip)
+            display_ip = name[:20]  # limit to 20 characters
+        ip_item = QTableWidgetItem(display_ip)
+        ip_item.setData(Qt.UserRole, str(source_ip))  # store actual IP for coloring/searching
+        self.table.setItem(row, 0, ip_item)
+        
+        # Remaining columns: FIELD_NAMES data
         for col_index in range(len(FIELD_NAMES)):
             val = parsed[col_index] if col_index < len(parsed) else ''
             item = QTableWidgetItem(str(val))
-            self.table.setItem(row, col_index, item)
-            
+            self.table.setItem(row, col_index + 1, item)
+        
+        # Apply source IP color if enabled (alternating between color1 and color2)
+        if self._use_source_colors:
+            colors = self._color_map.get(source_ip)
+            if colors:
+                # Track row count for this IP to determine which color to use
+                count = self._source_ip_count.get(source_ip, 0)
+                color_hex = colors[count % 2]  # Alternate between color1 and color2
+                self._source_ip_count[source_ip] = count + 1
+                self._apply_row_color(row, color_hex)            
     def _update_status(self):
-        """Update the status bar."""
-        state = (
-            "Connected to SMDR Server"
-            if self.connection_mode == "network"
-            else f"LOG FILE: {self.log_path.name}"
-        )
-        self.status.setText(f"{state} — Lines displayed: {self.lines_displayed}")
-        # Keep header in sync
+        """Update the status bar and connection header."""
         if self.connection_mode == "network":
-            self.header_label.setText("Connected to SMDR Server")
-            self.header_label.setStyleSheet("font-weight: bold; color: blue;")
+            state = "Connected to SMDR Server"
+            self.header_label.setText(state)
+            self.header_label.setStyleSheet("font-weight: bold; font-size: 12pt; color: green; padding: 4px;")
         else:
-            self.header_label.setText(f"LOG FILE: {self.log_path.name}")
-            self.header_label.setStyleSheet("font-weight: bold; color: green;")
+            state = f"LOG FILE: {self.log_path.name}"
+            self.header_label.setText(state)
+            self.header_label.setStyleSheet("font-weight: bold; font-size: 12pt; color: blue; padding: 4px;")
+        self.status.setText(f"{state} — Lines displayed: {self.lines_displayed}")
         
     def _open_log_file(self):
         """Open a different log file."""
@@ -378,6 +530,283 @@ class SMDRViewer(QMainWindow):
             self.table.setPalette(pal)
         except Exception:
             pass
+
+    def _rebuild_color_map(self):
+        """Rebuild quick lookup map from list of color rules to support dual colors."""
+        self._color_map = {}
+        for entry in self._source_colors:
+            ip = str(entry.get('ip', '')).strip()
+            color1 = str(entry.get('color1', '')).strip()
+            color2 = str(entry.get('color2', '')).strip()
+            if ip and color1 and color2:
+                self._color_map[ip] = [color1, color2]
+
+    def _rebuild_name_map(self):
+        """Rebuild IP→name map from both dedicated name entries and color entries that carry names."""
+        self._name_map = {}
+
+        def add_name(ip_val: str, name_val: str):
+            ip_clean = str(ip_val or '').strip()
+            name_clean = str(name_val or '').strip()
+            if ip_clean and name_clean:
+                self._name_map[ip_clean] = name_clean[:20]
+
+        for entry in self._source_names:
+            if isinstance(entry, dict):
+                add_name(entry.get('ip'), entry.get('name'))
+
+        for entry in self._source_colors:
+            if isinstance(entry, dict):
+                add_name(entry.get('ip'), entry.get('name'))
+
+    def _refresh_source_name_display(self):
+        """Refresh the first column to show either IP or mapped name based on current settings."""
+        for row in range(self.table.rowCount()):
+            ip_item = self.table.item(row, 0)
+            if not ip_item:
+                continue
+            actual_ip = (ip_item.data(Qt.UserRole) if ip_item else None) or ip_item.text()
+            if self._use_source_names:
+                name = self._name_map.get(actual_ip, actual_ip)
+                ip_item.setText(str(name)[:20])
+            else:
+                ip_item.setText(str(actual_ip))
+
+    def _apply_row_color(self, row: int, color_hex: str):
+        """Apply a background color to the entire row."""
+        brush = QBrush(QColor(color_hex))
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
+
+    def _clear_row_color(self, row: int):
+        """Clear any custom background colors for the row."""
+        brush = QBrush()
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
+
+    def _recolor_all_rows(self):
+        """Reapply colors to all rows based on current settings with alternating support."""
+        # Reset IP counters
+        self._source_ip_count = {}
+        
+        for row in range(self.table.rowCount()):
+            if not self._use_source_colors:
+                self._clear_row_color(row)
+                continue
+            # Source IP is in column 0
+            ip_item = self.table.item(row, 0)
+            ip = (ip_item.data(Qt.UserRole) if ip_item else None) or (ip_item.text().strip() if ip_item else '')
+            colors = self._color_map.get(ip)
+            if colors:
+                # Alternate colors based on IP count
+                count = self._source_ip_count.get(ip, 0)
+                color_hex = colors[count % 2]
+                self._source_ip_count[ip] = count + 1
+                self._apply_row_color(row, color_hex)
+            else:
+                self._clear_row_color(row)
+
+    def _toggle_source_names(self):
+        """Enable/disable showing mapped source names instead of IPs."""
+        self._use_source_names = self._use_source_names_action.isChecked()
+        try:
+            self.config.set('use_source_names', self._use_source_names)
+            self.config.save_config()
+        except Exception:
+            pass
+        self._refresh_source_name_display()
+
+    def _configure_source_names(self):
+        """Configure source IP → name mappings."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configure Source Names")
+        dialog.resize(600, 450)
+        form = QFormLayout(dialog)
+        editors = []  # list of (ip_edit, name_edit)
+
+        def make_row(ip_val: str = '', name_val: str = ''):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            ip_edit = QLineEdit(ip_val)
+            ip_edit.setPlaceholderText("e.g. 192.168.1.10")
+
+            name_edit = QLineEdit(name_val)
+            name_edit.setPlaceholderText("Name (20 chars)")
+            name_edit.setMaxLength(20)
+
+            row_layout.addWidget(QLabel("IP:"))
+            row_layout.addWidget(ip_edit, 1)
+            row_layout.addWidget(QLabel("Name:"))
+            row_layout.addWidget(name_edit, 1)
+
+            editors.append((ip_edit, name_edit))
+            return row_widget
+
+        for entry in (self._source_names + [{}] * 10)[:10]:
+            ip = entry.get('ip', '') if isinstance(entry, dict) else ''
+            name = entry.get('name', '') if isinstance(entry, dict) else ''
+            form.addRow(make_row(ip, name))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            new_names = []
+            for ip_edit, name_edit in editors:
+                ip = ip_edit.text().strip()
+                name = name_edit.text().strip()
+                if ip and name:
+                    new_names.append({'ip': ip, 'name': name[:20]})
+                if len(new_names) >= 10:
+                    break
+            self._source_names = new_names
+            self._rebuild_name_map()
+            try:
+                self.config.set('source_names', self._source_names)
+                self.config.save_config()
+            except Exception:
+                pass
+            self._refresh_source_name_display()
+
+    def _toggle_source_colors(self):
+        self._use_source_colors = self._use_source_colors_action.isChecked()
+        # Persist
+        try:
+            self.config.set('use_source_colors', self._use_source_colors)
+            self.config.save_config()
+        except Exception:
+            pass
+        self._recolor_all_rows()
+
+    def _configure_source_colors(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Configure Source Colors (2 Colors Per IP)")
+        dialog.resize(650, 450)
+        form = QFormLayout(dialog)
+        editors = []  # list of (ip_edit, name_edit, color1_btn, color2_btn)
+
+        # Preserve existing name mappings so we can keep names when only colors change
+        existing_name_map = {}
+        for entry in self._source_names:
+            if isinstance(entry, dict) and entry.get('ip') and entry.get('name'):
+                existing_name_map[str(entry['ip']).strip()] = str(entry['name']).strip()[:20]
+
+        # Helper to make a row editor with 2 color buttons
+        def make_row(ip_val: str = '', name_val: str = '', color1_val: str = '', color2_val: str = ''):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            ip_edit = QLineEdit(ip_val)
+            ip_edit.setPlaceholderText("e.g. 192.168.1.10")
+
+            name_edit = QLineEdit(name_val)
+            name_edit.setPlaceholderText("Name (20 chars)")
+            name_edit.setMaxLength(20)
+            
+            color1_btn = QPushButton()
+            color1_btn.setText(color1_val or "Color 1")
+            if color1_val:
+                color1_btn.setStyleSheet(f"background-color: {color1_val}")
+
+            color2_btn = QPushButton()
+            color2_btn.setText(color2_val or "Color 2")
+            if color2_val:
+                color2_btn.setStyleSheet(f"background-color: {color2_val}")
+
+            def pick_color1():
+                initial = QColor(color1_val) if color1_val else QColor('#e0f7fa')
+                c = QColorDialog.getColor(initial, self, "Choose Color 1")
+                if c.isValid():
+                    hexv = c.name()
+                    color1_btn.setText(hexv)
+                    color1_btn.setStyleSheet(f"background-color: {hexv}")
+
+            def pick_color2():
+                initial = QColor(color2_val) if color2_val else QColor('#b2ebf2')
+                c = QColorDialog.getColor(initial, self, "Choose Color 2")
+                if c.isValid():
+                    hexv = c.name()
+                    color2_btn.setText(hexv)
+                    color2_btn.setStyleSheet(f"background-color: {hexv}")
+
+            color1_btn.clicked.connect(pick_color1)
+            color2_btn.clicked.connect(pick_color2)
+
+            row_layout.addWidget(QLabel("IP:"))
+            row_layout.addWidget(ip_edit, 1)
+            row_layout.addWidget(QLabel("Name:"))
+            row_layout.addWidget(name_edit, 1)
+            row_layout.addWidget(color1_btn)
+            row_layout.addWidget(color2_btn)
+
+            editors.append((ip_edit, name_edit, color1_btn, color2_btn))
+            return row_widget
+
+        # Pre-fill existing up to 10 rows
+        for entry in (self._source_colors + [{}] * 10)[:10]:
+            ip = entry.get('ip', '') if isinstance(entry, dict) else ''
+            name = entry.get('name', '') if isinstance(entry, dict) else ''
+            color1 = entry.get('color1', '') if isinstance(entry, dict) else ''
+            color2 = entry.get('color2', '') if isinstance(entry, dict) else ''
+            form.addRow(make_row(ip, name, color1, color2))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.Accepted:
+            new_rules = []
+            merged_name_map = dict(existing_name_map)
+            for ip_edit, name_edit, color1_btn, color2_btn in editors:
+                ip = ip_edit.text().strip()
+                name = name_edit.text().strip()
+                color1 = color1_btn.text().strip()
+                color2 = color2_btn.text().strip()
+                if ip and color1 and color1.startswith('#') and color2 and color2.startswith('#'):
+                    entry = {'ip': ip, 'color1': color1, 'color2': color2}
+                    name_to_use = name or existing_name_map.get(ip, '')
+                    if name_to_use:
+                        name_to_use = name_to_use[:20]
+                        entry['name'] = name_to_use
+                        merged_name_map[ip] = name_to_use
+                    new_rules.append(entry)
+                if len(new_rules) >= 10:
+                    break
+            self._source_colors = new_rules
+            self._rebuild_color_map()
+            # Merge name mappings, prioritizing entries in the color list order
+            ordered_names = []
+            seen = set()
+            for entry in new_rules:
+                ip = entry.get('ip')
+                name_val = entry.get('name')
+                if ip and name_val and ip not in seen:
+                    ordered_names.append({'ip': ip, 'name': name_val})
+                    seen.add(ip)
+            for ip, name_val in merged_name_map.items():
+                if ip not in seen and name_val:
+                    ordered_names.append({'ip': ip, 'name': name_val})
+            self._source_names = ordered_names[:10]
+            self._rebuild_name_map()
+            # Persist
+            try:
+                self.config.set('source_colors', self._source_colors)
+                self.config.set('source_names', self._source_names)
+                self.config.save_config()
+            except Exception:
+                pass
+            self._recolor_all_rows()
+            self._refresh_source_name_display()
 
     def _show_about(self):
         """Show an About dialog."""
@@ -540,21 +969,11 @@ class SMDRViewer(QMainWindow):
         
         layout = QFormLayout(dialog)
         
-        # Port (SMDR receiver port)
+        # Port
         port_input = QSpinBox()
         port_input.setRange(1, 65535)
         port_input.setValue(self.config.get_port())
-        layout.addRow("Receiver Port:", port_input)
-
-        # Viewer broadcast port
-        viewer_port_input = QSpinBox()
-        viewer_port_input.setRange(1, 65535)
-        viewer_port_input.setValue(self.config.get_viewer_port())
-        layout.addRow("Viewer Port:", viewer_port_input)
-
-        # Service host for viewer
-        host_input = QLineEdit(self.config.get_service_host())
-        layout.addRow("Service Host:", host_input)
+        layout.addRow("Port:", port_input)
         
         # Log file
         log_widget = QWidget()
@@ -599,34 +1018,22 @@ class SMDRViewer(QMainWindow):
 
         if dialog.exec() == QDialog.Accepted:
             new_port = port_input.value()
-            new_viewer_port = viewer_port_input.value()
-            new_host = host_input.text().strip() or "localhost"
             new_log = Path(log_input.text())
-
             old_port = self.config.get_port()
-            old_viewer_port = self.config.get_viewer_port()
-            old_host = self.config.get_service_host()
             old_log = self.config.get_log_file()
 
-            changed = (
-                (new_port != old_port) or
-                (new_viewer_port != old_viewer_port) or
-                (new_host != old_host) or
-                (new_log != old_log)
-            )
+            changed = (new_port != old_port) or (new_log != old_log)
 
             if changed or dialog._restart_requested:
                 # Save configuration
                 self.config.set_port(new_port)
-                self.config.set_viewer_port(new_viewer_port)
-                self.config.set_service_host(new_host)
                 self.config.set_log_file(new_log)
 
                 # Restart if requested or if settings changed
                 if dialog._restart_requested or changed:
                     if self._restart_service():
                         # Update viewer to use new log file
-                        self.log_path = self.config.get_log_file()
+                        self.log_path = new_log
                         self.last_position = 0
                         self.lines_displayed = 0
                         self.table.setRowCount(0)
@@ -640,87 +1047,6 @@ class SMDRViewer(QMainWindow):
                         QMessageBox.information(self, "Success", "Service restarted with new configuration.")
                 else:
                     QMessageBox.information(self, "Saved", "Configuration saved. Restart the service to apply changes.")
-
-    def _start_network_client(self):
-        """Connect to the service's viewer broadcast and stream live data."""
-        if self.connection_mode == "network":
-            return
-        host = self.config.get_service_host()
-        port = self.config.get_viewer_port()
-        try:
-            sock = socket.create_connection((host, port), timeout=5)
-        except Exception as e:
-            QMessageBox.warning(self, "Connection Failed", f"Could not connect to {host}:{port}\n{e}")
-            return
-
-        # Switch to network mode: stop file polling
-        self.connection_mode = "network"
-        try:
-            self.timer.stop()
-        except Exception:
-            pass
-        try:
-            self.file_watcher.removePaths(self.file_watcher.files())
-        except Exception:
-            pass
-
-        self._net_sock = sock
-        self._net_running.set()
-        self._net_thread = threading.Thread(target=self._network_loop, daemon=True)
-        self._net_thread.start()
-        self._update_status()
-
-    def _stop_network_client(self):
-        """Disconnect from the service and return to file mode."""
-        if self.connection_mode != "network":
-            return
-        self._net_running.clear()
-        try:
-            if self._net_sock:
-                try:
-                    self._net_sock.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                self._net_sock.close()
-        except Exception:
-            pass
-        self._net_sock = None
-        try:
-            if self._net_thread and self._net_thread.is_alive():
-                self._net_thread.join(timeout=1.0)
-        except Exception:
-            pass
-        self._net_thread = None
-
-        # Return to file mode
-        self.connection_mode = "file"
-        if self.log_path.exists():
-            try:
-                self.file_watcher.addPath(str(self.log_path))
-            except Exception:
-                pass
-        try:
-            self.timer.start(1000)
-        except Exception:
-            pass
-        self._update_status()
-
-    def _network_loop(self):
-        """Read lines from the network socket and process them."""
-        try:
-            f = self._net_sock.makefile("r", encoding="utf-8", errors="replace")
-            while self._net_running.is_set():
-                line = f.readline()
-                if not line:
-                    break
-                self._process_line(line.strip())
-                self.lines_displayed += 1
-                self._update_status()
-        except Exception:
-            pass
-        finally:
-            # Auto-switch to file mode on disconnect on the GUI thread
-            QTimer.singleShot(0, self._stop_network_client)
     
     def _browse_log_file(self, line_edit):
         """Browse for log file location."""
@@ -823,6 +1149,141 @@ class SMDRViewer(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error checking service status:\n{e}")
+
+    def _start_network_client(self):
+        """Show dialog to connect to the service's viewer broadcast."""
+        if self.connection_mode == "network":
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Connect to SMDR Service")
+        dialog.resize(400, 150)
+        form = QFormLayout(dialog)
+
+        # Host input
+        host_input = QLineEdit()
+        host_input.setText(self.config.get('service_host', 'localhost'))
+        host_input.setPlaceholderText("e.g. 192.168.1.100 or localhost")
+        form.addRow("Server Host:", host_input)
+
+        # Port input
+        port_input = QSpinBox()
+        port_input.setRange(1, 65535)
+        port_input.setValue(self.config.get('viewer_port', 7010))
+        form.addRow("Port:", port_input)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        host = host_input.text().strip() or 'localhost'
+        port = port_input.value()
+
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+        except Exception as e:
+            QMessageBox.warning(self, "Connection Failed", f"Could not connect to {host}:{port}\n{e}")
+            return
+
+        # Save these settings
+        try:
+            self.config.set('service_host', host)
+            self.config.set('viewer_port', port)
+            self.config.save_config()
+        except Exception:
+            pass
+
+        # Switch to network mode: stop file polling
+        self.connection_mode = "network"
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            self.file_watcher.removePaths(self.file_watcher.files())
+        except Exception:
+            pass
+
+        self._net_sock = sock
+        self._net_running.set()
+        self._net_thread = threading.Thread(target=self._network_loop, daemon=True)
+        self._net_thread.start()
+        self._update_status()
+
+    def _stop_network_client(self):
+        """Disconnect from the service and return to file mode."""
+        if self.connection_mode != "network":
+            return
+        self._net_running.clear()
+        try:
+            if self._net_sock:
+                try:
+                    self._net_sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                self._net_sock.close()
+        except Exception:
+            pass
+        self._net_sock = None
+        try:
+            if self._net_thread and self._net_thread.is_alive():
+                self._net_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._net_thread = None
+
+        # Return to file mode
+        self.connection_mode = "file"
+        if self.log_path.exists():
+            try:
+                self.file_watcher.addPath(str(self.log_path))
+            except Exception:
+                pass
+        try:
+            self.timer.start(1000)
+        except Exception:
+            pass
+        self._update_status()
+
+    def _network_loop(self):
+        """Read lines from the network socket and process them."""
+        try:
+            # Set TCP_NODELAY on viewer socket to receive immediately
+            try:
+                self._net_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            self._net_sock.setblocking(True)
+            self._net_sock.settimeout(1.0)  # 1 second timeout for recv
+            
+            buffer = ""
+            while self._net_running.is_set():
+                try:
+                    data = self._net_sock.recv(4096)
+                    if not data:
+                        break
+                    buffer += data.decode("utf-8", errors="replace")
+                    
+                    # Process complete lines
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        if line.strip():
+                            self._process_line(line.strip())
+                    self._update_status()
+                except socket.timeout:
+                    # Timeout is normal, just keep trying
+                    continue
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
+            # Auto-switch to file mode on disconnect on the GUI thread
+            QTimer.singleShot(0, self._stop_network_client)
 
 
 def main():
